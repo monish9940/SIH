@@ -1,7 +1,14 @@
 import axios from 'axios';
 
-const rawUrl = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || 'https://sih-b9dp.onrender.com';
-const cleanUrl = rawUrl.replace(/\/+$/, '');
+let envUrl = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || '';
+if (!envUrl || envUrl.includes('localhost') || envUrl.includes('127.0.0.1')) {
+  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    envUrl = 'https://sih-b9dp.onrender.com';
+  } else {
+    envUrl = envUrl || 'http://localhost:8000';
+  }
+}
+const cleanUrl = envUrl.replace(/\/+$/, '');
 const baseURL = cleanUrl.endsWith('/api') ? cleanUrl : `${cleanUrl}/api`;
 
 const api = axios.create({
