@@ -6,6 +6,7 @@ const baseURL = cleanUrl.endsWith('/api') ? cleanUrl : `${cleanUrl}/api`;
 
 const api = axios.create({
   baseURL,
+  timeout: 120000,
   headers: {
     'Content-Type': 'application/json',
   },

@@ -73,12 +73,17 @@ def preprocess_image_fast(image_path: str,
                            ) -> tuple[np.ndarray, float]:
     """
     Read image and resize (downscale only) to target_max_dim while keeping
-    aspect ratio.  INTER_AREA gives the sharpest result for downscaling text.
+    aspect ratio. Supports JPG, PNG, WEBP, BMP via OpenCV + PIL fallback.
     Returns (optimised_image, scale_factor).
     """
     img = cv2.imread(image_path)
     if img is None:
-        raise ValueError(f"Could not read image file: {image_path}")
+        try:
+            from PIL import Image
+            pil_img = Image.open(image_path).convert("RGB")
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except Exception as err:
+            raise ValueError(f"Could not read image file: {image_path} ({err})")
 
     h, w = img.shape[:2]
     max_dim = max(h, w)
