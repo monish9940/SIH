@@ -17,14 +17,6 @@ logger = logging.getLogger("main")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_to_mongo()
-    # Pre-warm EasyOCR reader at application startup
-    try:
-        from app.services.ocr_service import get_easyocr_reader
-        logger.info("Pre-warming EasyOCR reader at application startup...")
-        get_easyocr_reader()
-        logger.info("EasyOCR reader pre-warmed successfully.")
-    except Exception as e:
-        logger.warning(f"EasyOCR reader pre-warm failed: {e}")
     yield
     await close_mongo_connection()
 
