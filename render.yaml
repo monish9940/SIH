@@ -27,12 +27,11 @@ services:
     buildCommand: npm install && npm run build
     staticPublishPath: dist
     envVars:
-      - key: VITE_API_BASE_URL
+      - key: VITE_API_URL
         fromService:
           type: web
           name: sih-legal-metrology-backend
           property: url
-          suffix: /api
     routes:
       - type: rewrite
         source: /*
