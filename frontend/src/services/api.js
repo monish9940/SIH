@@ -1,18 +1,20 @@
 import axios from 'axios';
 
-let envUrl = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || '';
-if (!envUrl || envUrl.includes('localhost') || envUrl.includes('127.0.0.1')) {
-  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-    envUrl = 'https://sih-b9dp.onrender.com';
-  } else {
-    envUrl = envUrl || 'http://localhost:8000';
-  }
+const rawEnv = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || 'https://sih-b9dp.onrender.com';
+let targetHost = rawEnv.trim().replace(/\/+$/, '');
+
+// Ensure HTTPS scheme for production remote hosts to prevent Mixed Content security blocks
+if (targetHost.includes('onrender.com') && targetHost.startsWith('http://')) {
+  targetHost = targetHost.replace('http://', 'https://');
 }
-if (envUrl.includes('onrender.com') && envUrl.startsWith('http://')) {
-  envUrl = envUrl.replace('http://', 'https://');
+
+// Fallback to live production backend if local URL is evaluated on a production browser origin
+if ((targetHost.includes('localhost') || targetHost.includes('127.0.0.1')) && typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+  targetHost = 'https://sih-b9dp.onrender.com';
 }
-const cleanUrl = envUrl.replace(/\/+$/, '');
-const baseURL = cleanUrl.endsWith('/api') ? cleanUrl : `${cleanUrl}/api`;
+
+// Construct clean baseURL without duplicate /api suffix
+const baseURL = targetHost.endsWith('/api') ? targetHost : `${targetHost}/api`;
 
 const api = axios.create({
   baseURL,

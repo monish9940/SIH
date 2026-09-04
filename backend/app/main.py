@@ -37,11 +37,22 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": f"{type(exc).__name__}: {exc}", "traceback": tb}
     )
 
-# CORS setup — allow_origin_regex dynamically matches any HTTP/HTTPS origin (including Vercel)
-# and reflects requesting origin to satisfy browser Access-Control-Allow-Credentials requirements
+# CORS setup: explicitly allow production Vercel frontend, preview branches, and local dev
+allowed_origins = [
+    "https://sih-phi-lilac.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+]
+env_origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip() and o.strip() != "*"]
+for o in env_origins:
+    if o not in allowed_origins:
+        allowed_origins.append(o)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https?://.*",
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
