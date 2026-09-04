@@ -76,3 +76,7 @@ async def root():
         "ministry": "Ministry of Consumer Affairs, Food & Public Distribution",
         "status": "OPERATIONAL"
     }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}

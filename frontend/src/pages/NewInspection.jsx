@@ -71,9 +71,7 @@ const NewInspection = () => {
       formData.append('commodity_type', commodityType);
       formData.append('inspection_profile', inspectionProfile);
 
-      const res = await api.post('/inspections', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
-      });
+      const res = await api.post('/inspections', formData);
 
       const { inspection_id } = res.data;
 
@@ -90,8 +88,16 @@ const NewInspection = () => {
 
       if (detail) {
         errMsg = typeof detail === 'string' ? detail : JSON.stringify(detail);
+      } else if (status === 401) {
+        errMsg = 'Session expired or unauthenticated. Please log in again.';
+      } else if (status === 403) {
+        errMsg = 'Forbidden: You do not have permission for this action.';
+      } else if (status === 422) {
+        errMsg = 'Unprocessable Entity (HTTP 422): Invalid image payload or parameters.';
       } else if (status) {
-        errMsg = `Server Error (HTTP ${status}): Unable to process inspection at this time.`;
+        errMsg = `Server Error (HTTP ${status}): Unable to process inspection.`;
+      } else if (err.code === 'ERR_NETWORK' || err.message?.includes('Network Error')) {
+        errMsg = 'Network Error: Connection failed. Please check backend server status.';
       } else if (err.message) {
         errMsg = err.message;
       }
