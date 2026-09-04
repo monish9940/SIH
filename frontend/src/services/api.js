@@ -24,12 +24,15 @@ const api = axios.create({
   },
 });
 
-// Interceptor to inject JWT Bearer token
+// Interceptor to inject JWT Bearer token and handle FormData headers
 api.interceptors.request.use(
   (config) => {
     const token = localStorage.getItem('compliance_token');
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
+    }
+    if (config.data instanceof FormData) {
+      delete config.headers['Content-Type'];
     }
     return config;
   },

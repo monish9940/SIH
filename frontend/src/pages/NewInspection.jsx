@@ -56,8 +56,8 @@ const NewInspection = () => {
   };
 
   const handleAnalyze = async () => {
-    if (!selectedFile) {
-      setError('Please upload or select a packaged commodity image file first.');
+    if (!selectedFile || !(selectedFile instanceof File)) {
+      setError('Please upload or select a valid packaged commodity image file first.');
       return;
     }
 
