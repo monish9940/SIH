@@ -8,6 +8,9 @@ if (!envUrl || envUrl.includes('localhost') || envUrl.includes('127.0.0.1')) {
     envUrl = envUrl || 'http://localhost:8000';
   }
 }
+if (envUrl.includes('onrender.com') && envUrl.startsWith('http://')) {
+  envUrl = envUrl.replace('http://', 'https://');
+}
 const cleanUrl = envUrl.replace(/\/+$/, '');
 const baseURL = cleanUrl.endsWith('/api') ? cleanUrl : `${cleanUrl}/api`;
 
