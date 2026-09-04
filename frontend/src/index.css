@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+@theme {
+  --color-navy-950: #060D17;
+  --color-navy-900: #0B192C;
+  --color-navy-800: #0F2137;
+  --color-navy-700: #1E293B;
+  --color-navy-600: #334155;
+
+  --color-gov-blue: #0B192C;
+  --color-gov-lightBg: #F8FAFC;
+  --color-gov-border: #E2E8F0;
+  --color-gov-orange: #F97316;
+  --color-gov-darkOrange: #EA580C;
+  --color-gov-accentGreen: #16A34A;
+  --color-gov-accentRed: #DC2626;
+}
+
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-800 antialiased font-sans min-h-screen flex flex-col;
+  }
+}
+
+.badge-compliant {
+  @apply bg-emerald-100 text-emerald-800 border border-emerald-300 px-2.5 py-0.5 rounded-full text-xs font-medium inline-flex items-center gap-1;
+}
+
+.badge-violation {
+  @apply bg-red-100 text-red-800 border border-red-300 px-2.5 py-0.5 rounded-full text-xs font-medium inline-flex items-center gap-1;
+}
+
+.badge-pending {
+  @apply bg-amber-100 text-amber-800 border border-amber-300 px-2.5 py-0.5 rounded-full text-xs font-medium inline-flex items-center gap-1;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  height: 6px;
+  width: 6px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
