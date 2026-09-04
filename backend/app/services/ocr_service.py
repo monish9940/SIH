@@ -5,15 +5,22 @@ import os
 import time
 import logging
 import threading
+import gc
 
 logger = logging.getLogger("ocr_service")
 
 # ──────────────────────────────────────────────
 # CPU Thread tuning (PyTorch / BLAS)
+# Enforce single-thread execution to minimize memory allocation overhead
 # ──────────────────────────────────────────────
 try:
     import torch
-    torch.set_num_threads(max(1, os.cpu_count() or 4))
+    torch.set_num_threads(1)
+    if hasattr(torch, "set_num_interop_threads"):
+        try:
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
 except Exception:
     pass
 
@@ -52,12 +59,15 @@ def get_easyocr_reader():
             return None
         try:
             import easyocr
-            _easyocr_reader = easyocr.Reader(
-                ['en'],
-                gpu=False,
-                verbose=False,
-                quantize=True,          # FP16 quantised CRNN — faster on CPU
-            )
+            import torch
+            with torch.no_grad():
+                _easyocr_reader = easyocr.Reader(
+                    ['en'],
+                    gpu=False,
+                    verbose=False,
+                    quantize=True,          # FP16 quantised CRNN — faster on CPU
+                )
+            gc.collect()
             logger.info("EasyOCR Reader initialised successfully (quantized CPU mode).")
         except Exception as e:
             logger.warning(f"EasyOCR initialisation failed: {e}")
@@ -201,15 +211,23 @@ def run_ocr_with_metrics(image_path: str) -> tuple[str, float, dict]:
     #   width_ths=0.7       – merge close horizontal boxes (fewer recognition calls)
     #   workers=0           – disable multiprocessing fork overhead per call
     t0 = time.time()
-    results_p1 = reader.readtext(
-        img_opt,
-        canvas_size=_CANVAS_SIZE,
-        detail=1,
-        text_threshold=0.6,
-        low_text=0.35,
-        width_ths=0.7,
-        workers=0,
-    )
+    try:
+        import torch
+        with torch.no_grad():
+            results_p1 = reader.readtext(
+                img_opt,
+                canvas_size=_CANVAS_SIZE,
+                detail=1,
+                text_threshold=0.6,
+                low_text=0.35,
+                width_ths=0.7,
+                workers=0,
+            )
+    except Exception as err:
+        logger.error(f"EasyOCR pass-1 error: {err}")
+        results_p1 = []
+    finally:
+        gc.collect()
     inf1_sec = time.time() - t0
 
     blocks_p1 = parse_easyocr_blocks(results_p1, mode="standard")
@@ -233,18 +251,22 @@ def run_ocr_with_metrics(image_path: str) -> tuple[str, float, dict]:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(gray)
             enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-            results_p2 = reader.readtext(
-                enhanced_bgr,
-                canvas_size=_CANVAS_SIZE,
-                detail=1,
-                text_threshold=0.6,
-                low_text=0.35,
-                width_ths=0.7,
-                workers=0,
-            )
+            import torch
+            with torch.no_grad():
+                results_p2 = reader.readtext(
+                    enhanced_bgr,
+                    canvas_size=_CANVAS_SIZE,
+                    detail=1,
+                    text_threshold=0.6,
+                    low_text=0.35,
+                    width_ths=0.7,
+                    workers=0,
+                )
             blocks_p2 = parse_easyocr_blocks(results_p2, mode="clahe")
         except Exception as exc:
             logger.debug(f"CLAHE pass error: {exc}")
+        finally:
+            gc.collect()
         inf2_sec = time.time() - t0
 
     # 5. Merge blocks and reconstruct text
