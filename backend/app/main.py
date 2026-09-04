@@ -37,11 +37,11 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": f"{type(exc).__name__}: {exc}", "traceback": tb}
     )
 
-# CORS setup
-origins = settings.CORS_ORIGINS.split(",")
+# CORS setup — allow_origin_regex dynamically matches any HTTP/HTTPS origin (including Vercel)
+# and reflects requesting origin to satisfy browser Access-Control-Allow-Credentials requirements
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins + ["*"],
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
