@@ -84,7 +84,15 @@ const NewInspection = () => {
       navigate(`/inspection/${inspection_id}`);
     } catch (err) {
       console.error('Analysis error:', err);
-      setError(err.response?.data?.detail || 'Failed to process inspection image. Please try again.');
+      let errMsg = 'Failed to process inspection image. Please try again.';
+      if (err.response?.data?.detail) {
+        errMsg = err.response.data.detail;
+      } else if (err.code === 'ERR_NETWORK' || err.message?.includes('Network Error')) {
+        errMsg = 'Network Error: Unable to connect to the backend server. Please verify VITE_API_URL is configured on Vercel.';
+      } else if (err.message) {
+        errMsg = err.message;
+      }
+      setError(errMsg);
       setAnalyzing(false);
     }
   };
