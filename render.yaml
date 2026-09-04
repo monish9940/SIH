@@ -1,0 +1,39 @@
+services:
+  # Backend FastAPI Service
+  - type: web
+    name: sih-legal-metrology-backend
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: Dockerfile
+    plan: free
+    region: singapore
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: MONGODB_URL
+        sync: false
+      - key: DATABASE_NAME
+        value: legal_metrology
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: "*"
+
+  # Frontend React Static Site
+  - type: static
+    name: sih-legal-metrology-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: sih-legal-metrology-backend
+          property: url
+          suffix: /api
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
