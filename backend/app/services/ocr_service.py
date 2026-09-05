@@ -73,7 +73,7 @@ def get_easyocr_reader():
                 _easyocr_reader = easyocr.Reader(
                     ['en'],
                     gpu=False,
-                    verbose=True,
+                    verbose=False,          # Set verbose=False to prevent progress hook Unicode crashes on Windows console
                     quantize=True,          # FP16 quantised CRNN — faster on CPU
                     model_storage_directory=MODEL_DIR,
                     user_network_directory=MODEL_DIR,

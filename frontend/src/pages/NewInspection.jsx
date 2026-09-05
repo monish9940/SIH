@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import api from '../services/api';
 import { ArrowLeft, UploadCloud, FileImage, Cpu, Info, Check, AlertCircle } from 'lucide-react';
@@ -22,7 +22,17 @@ const NewInspection = () => {
   const [error, setError] = useState('');
 
   const fileInputRef = useRef(null);
+  const pollTimerRef = useRef(null);
   const navigate = useNavigate();
+
+  // Cleanup polling timer on component unmount
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+      }
+    };
+  }, []);
 
   const handleFileSelect = (e) => {
     const file = e.target.files[0];
@@ -72,16 +82,53 @@ const NewInspection = () => {
       formData.append('inspection_profile', inspectionProfile);
 
       const res = await api.post('/inspections', formData);
-
       const { inspection_id } = res.data;
 
-      // 2. Trigger OCR & Compliance Analysis
-      const analyzeRes = await api.post(`/inspections/${inspection_id}/analyze`);
+      // 2. Trigger async OCR & Compliance Analysis (returns 202 Accepted)
+      await api.post(`/inspections/${inspection_id}/analyze`);
 
-      // 3. Navigate to Inspection Result Screen
-      navigate(`/inspection/${inspection_id}`);
+      // 3. Poll analysis-status until COMPLETED or FAILED
+      const startTime = Date.now();
+      const POLLING_INTERVAL_MS = 1500;
+      const POLLING_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes timeout
+
+      pollTimerRef.current = setInterval(async () => {
+        try {
+          if (Date.now() - startTime > POLLING_TIMEOUT_MS) {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+            setError('Analysis is taking longer than expected. Please check your Inspection History shortly.');
+            setAnalyzing(false);
+            return;
+          }
+
+          const statusRes = await api.get(`/inspections/${inspection_id}/analysis-status`);
+          const { status, error: statusError } = statusRes.data;
+
+          if (status === 'COMPLETED') {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+            navigate(`/inspection/${inspection_id}`);
+          } else if (status === 'FAILED') {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+            setError(statusError || 'Analysis failed. Please try uploading a clearer image.');
+            setAnalyzing(false);
+          }
+        } catch (pollErr) {
+          console.error('Polling error:', pollErr);
+          const pollStatusCode = pollErr.response?.status;
+          if (pollStatusCode === 401 || pollStatusCode === 403 || pollStatusCode === 404) {
+            clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+            setError(pollErr.response?.data?.detail || 'Unauthorized or inspection not found.');
+            setAnalyzing(false);
+          }
+        }
+      }, POLLING_INTERVAL_MS);
+
     } catch (err) {
-      console.error('Analysis error:', err);
+      console.error('Analysis trigger error:', err);
       const detail = err.response?.data?.detail;
       const status = err.response?.status;
       let errMsg = 'Failed to process inspection image. Please try again.';
@@ -94,8 +141,10 @@ const NewInspection = () => {
         errMsg = 'Forbidden: You do not have permission for this action.';
       } else if (status === 422) {
         errMsg = 'Unprocessable Entity (HTTP 422): Invalid image payload or parameters.';
+      } else if (status === 503) {
+        errMsg = 'OCR Engine is initializing on server. Please try again in a few seconds.';
       } else if (status) {
-        errMsg = `Server Error (HTTP ${status}): Unable to process inspection.`;
+        errMsg = `Server Error (HTTP ${status}): Unable to start analysis.`;
       } else if (err.code === 'ERR_NETWORK' || err.message?.includes('Network Error')) {
         errMsg = 'Network Error: Connection failed. Please check backend server status.';
       } else if (err.message) {

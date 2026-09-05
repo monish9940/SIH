@@ -6,6 +6,7 @@ backend/.env
 frontend/.env
 backend/venv/
 backend/uploads/
+backend/models/
 node_modules/
 dist/
 __pycache__/
