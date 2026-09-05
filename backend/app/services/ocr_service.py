@@ -32,8 +32,10 @@ except Exception:
 _easyocr_reader = None
 _easyocr_lock = threading.Lock()
 _ocr_ready = False
+_easyocr_init_error = None
 
 MODEL_DIR = os.getenv("EASYOCR_MODEL_DIR", "/app/models/easyocr" if os.path.exists("/app") else os.path.join(os.getcwd(), "models", "easyocr"))
+MODEL_DIR = os.path.abspath(MODEL_DIR)
 try:
     os.makedirs(MODEL_DIR, exist_ok=True)
 except Exception:
@@ -49,43 +51,56 @@ _FALLBACK_MIN_BLOCKS = 3   # only retry if almost nothing was detected
 
 
 def is_ocr_ready() -> bool:
-    """Return True if EasyOCR reader has been successfully initialized and prewarmed."""
-    global _ocr_ready
-    return _ocr_ready
+    """Return True only if EasyOCR reader is instantiated and ready."""
+    global _easyocr_reader, _ocr_ready
+    return _easyocr_reader is not None and _ocr_ready is True
 
 
 def get_easyocr_reader():
-    """Return the singleton EasyOCR Reader, initialising it if necessary with retry support."""
-    global _easyocr_reader, _ocr_ready
-    if _easyocr_reader is not None:
+    """Return the singleton EasyOCR Reader, initialising it if necessary."""
+    global _easyocr_reader, _ocr_ready, _easyocr_init_error
+    if _easyocr_reader is not None and _ocr_ready:
         return _easyocr_reader
 
     with _easyocr_lock:
-        # Double-checked locking without permanent failure lock out
-        if _easyocr_reader is not None:
+        if _easyocr_reader is not None and _ocr_ready:
             return _easyocr_reader
+
+        if _easyocr_init_error is not None:
+            logger.error(f"EasyOCR reader cannot be retrieved due to prior startup error: {_easyocr_init_error}")
+            return None
+
+        t0 = time.perf_counter()
+        logger.info("EASYOCR INIT START")
+        logger.info(f"EASYOCR MODEL DIR: {MODEL_DIR}")
         try:
             import easyocr
             import torch
-            logger.info(f"EASYOCR MODEL DIR: {MODEL_DIR}")
-            logger.info(f"Initialising EasyOCR reader with model directory: {MODEL_DIR}")
             with torch.no_grad():
-                _easyocr_reader = easyocr.Reader(
+                reader = easyocr.Reader(
                     ['en'],
                     gpu=False,
-                    verbose=False,          # Set verbose=False to prevent progress hook Unicode crashes on Windows console
-                    quantize=True,          # FP16 quantised CRNN — faster on CPU
+                    verbose=False,
+                    quantize=True,
                     model_storage_directory=MODEL_DIR,
                     user_network_directory=MODEL_DIR,
                     download_enabled=True,
                 )
             gc.collect()
+            _easyocr_reader = reader
             _ocr_ready = True
-            logger.info("EasyOCR Reader initialised successfully (quantized CPU mode).")
+            _easyocr_init_error = None
+            duration = time.perf_counter() - t0
+            logger.info(f"EASYOCR INIT COMPLETE | duration={duration:.2f}s")
+            logger.info("EASYOCR READER READY")
         except Exception as e:
-            logger.error(f"EasyOCR initialisation error: {e}", exc_info=True)
+            err_msg = str(e)
+            logger.error(f"EASYOCR INIT FAILED | error={err_msg}", exc_info=True)
             _easyocr_reader = None
             _ocr_ready = False
+            _easyocr_init_error = err_msg
+            return None
+
     return _easyocr_reader
 
 

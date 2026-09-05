@@ -19,19 +19,21 @@ from app.routers import auth, inspections, dashboard, guidelines, contact
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
+from starlette.concurrency import run_in_threadpool
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Connecting to MongoDB Atlas...")
     await connect_to_mongo()
     logger.info("MongoDB Atlas connected successfully.")
 
-    logger.info("ASYNC ANALYSIS VERSION ACTIVE: 2026.09.05-v3")
+    logger.info("ASYNC ANALYSIS VERSION ACTIVE: 2026.09.05-v4")
     logger.info("ANALYZE ARCHITECTURE: 202_ACCEPTED_POLLING")
 
     logger.info("EASYOCR PREWARM START")
     t0 = time.perf_counter()
     from app.services.ocr_service import get_easyocr_reader
-    reader = get_easyocr_reader()
+    reader = await run_in_threadpool(get_easyocr_reader)
     duration = time.perf_counter() - t0
 
     if reader is None:
@@ -100,7 +102,7 @@ async def root():
         "department": "Department of Legal Metrology",
         "ministry": "Ministry of Consumer Affairs, Food & Public Distribution",
         "status": "OPERATIONAL",
-        "version": "2026.09.05-v3",
+        "version": "2026.09.05-v4",
         "architecture": "202_ACCEPTED_POLLING"
     }
 
@@ -111,7 +113,7 @@ async def health_check():
     return {
         "status": "ok",
         "ocr_ready": is_ocr_ready(),
-        "version": "2026.09.05-v3",
+        "version": "2026.09.05-v4",
         "architecture": "202_ACCEPTED_POLLING"
     }
 
