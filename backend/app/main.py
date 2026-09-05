@@ -25,6 +25,9 @@ async def lifespan(app: FastAPI):
     await connect_to_mongo()
     logger.info("MongoDB Atlas connected successfully.")
 
+    logger.info("ASYNC ANALYSIS VERSION ACTIVE: 2026.09.05-v3")
+    logger.info("ANALYZE ARCHITECTURE: 202_ACCEPTED_POLLING")
+
     logger.info("EASYOCR PREWARM START")
     t0 = time.perf_counter()
     from app.services.ocr_service import get_easyocr_reader
@@ -76,8 +79,8 @@ app.add_middleware(
     allow_origins=allowed_origins,
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
 )
 
 # Static file serving for uploads
@@ -96,7 +99,9 @@ async def root():
         "title": "Compliance Checker API",
         "department": "Department of Legal Metrology",
         "ministry": "Ministry of Consumer Affairs, Food & Public Distribution",
-        "status": "OPERATIONAL"
+        "status": "OPERATIONAL",
+        "version": "2026.09.05-v3",
+        "architecture": "202_ACCEPTED_POLLING"
     }
 
 @app.get("/health")
@@ -105,7 +110,9 @@ async def health_check():
     from app.services.ocr_service import is_ocr_ready
     return {
         "status": "ok",
-        "ocr_ready": is_ocr_ready()
+        "ocr_ready": is_ocr_ready(),
+        "version": "2026.09.05-v3",
+        "architecture": "202_ACCEPTED_POLLING"
     }
 
 if __name__ == "__main__":

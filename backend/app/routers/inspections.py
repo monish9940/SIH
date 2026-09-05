@@ -193,7 +193,7 @@ async def analyze_inspection(
     user: dict = Depends(get_current_user)
 ):
     logger = logging.getLogger("inspections_router")
-    logger.info(f"START ANALYZE [{inspection_id}]")
+    logger.info(f"START ANALYZE HTTP [{inspection_id}]")
 
     # Readiness guard: never initialize EasyOCR inside an HTTP request
     if not is_ocr_ready():
@@ -211,6 +211,13 @@ async def analyze_inspection(
     if inspection.get("user_id") != user_id:
         raise HTTPException(status_code=403, detail="Forbidden: You are not authorized to analyze this inspection record.")
 
+    filepath = inspection.get("image_path", "")
+    if not filepath or not os.path.exists(filepath):
+        raise HTTPException(status_code=400, detail="Inspection image file missing on server.")
+
+    logger.info(f"VALIDATION COMPLETE [{inspection_id}]")
+    logger.info(f"OCR READY [{inspection_id}]")
+
     # Prevent duplicate analysis jobs
     if inspection.get("analysis_status") == "PROCESSING":
         logger.info(f"ANALYSIS ALREADY IN PROGRESS [{inspection_id}]")
@@ -223,10 +230,6 @@ async def analyze_inspection(
             }
         )
 
-    filepath = inspection.get("image_path", "")
-    if not filepath or not os.path.exists(filepath):
-        raise HTTPException(status_code=400, detail="Inspection image file missing on server.")
-
     now = datetime.utcnow()
     await db.inspections.update_one(
         {"inspection_id": inspection_id},
@@ -238,7 +241,7 @@ async def analyze_inspection(
         }}
     )
 
-    logger.info(f"ANALYSIS JOB CREATED [{inspection_id}]")
+    logger.info(f"ANALYSIS STATUS SET PROCESSING [{inspection_id}]")
 
     task = asyncio.create_task(
         run_background_analysis(
@@ -252,6 +255,7 @@ async def analyze_inspection(
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
+    logger.info(f"BACKGROUND TASK CREATED [{inspection_id}]")
     logger.info(f"RETURNING 202 [{inspection_id}]")
 
     return JSONResponse(
