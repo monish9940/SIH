@@ -24,8 +24,8 @@ async def run_test():
     print(f"Testing analyze for {inspection_id}...")
     
     with TestClient(app) as client:
-        # Note: TestClient in FastAPI with Motor can sometimes be tricky with event loops.
-        # But let's try it.
+        health_res = client.get("/health")
+        print("HEALTH STATUS:", health_res.status_code, health_res.json())
         response = client.post(f"/api/inspections/{inspection_id}/analyze", headers=headers)
         print("STATUS:", response.status_code)
         print("RESPONSE:", response.text)

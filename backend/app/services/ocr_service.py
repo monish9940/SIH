@@ -29,49 +29,63 @@ except Exception:
 # Initialised ONCE at startup (main.py lifespan),
 # reused for every subsequent request.
 # ──────────────────────────────────────────────
-_easyocr_reader = None          # None  → not yet initialised
-_easyocr_init_failed = False    # True  → init already tried and failed
+_easyocr_reader = None
 _easyocr_lock = threading.Lock()
+_ocr_ready = False
+
+MODEL_DIR = os.getenv("EASYOCR_MODEL_DIR", "/app/models/easyocr" if os.path.exists("/app") else os.path.join(os.getcwd(), "models", "easyocr"))
+try:
+    os.makedirs(MODEL_DIR, exist_ok=True)
+except Exception:
+    pass
 
 # ── Performance constants ─────────────────────────────────────────────────
-# Reducing image size and canvas is the single biggest CPU speed lever.
-_TARGET_MAX_DIM   = 960    # Shrink images to ≤960px — still plenty for label text
-_CANVAS_SIZE      = 640    # EasyOCR internal canvas — 640 is the sweet-spot on CPU
+_TARGET_MAX_DIM   = 1400   # Max dimension for fast image downscaling
+_CANVAS_SIZE      = 1024   # EasyOCR internal canvas size for CPU processing
 # Pass-2 (CLAHE) is expensive (~same cost as pass 1). Only trigger it for
 # genuinely poor captures: very few blocks AND very low confidence.
-_FALLBACK_CONF    = 0.45   # was 0.72 — dramatically reduces unnecessary double-passes
-_FALLBACK_MIN_BLOCKS = 3   # was 6  — only retry if almost nothing was detected
+_FALLBACK_CONF    = 0.45   # dramatically reduces unnecessary double-passes
+_FALLBACK_MIN_BLOCKS = 3   # only retry if almost nothing was detected
+
+
+def is_ocr_ready() -> bool:
+    """Return True if EasyOCR reader has been successfully initialized and prewarmed."""
+    global _ocr_ready
+    return _ocr_ready
 
 
 def get_easyocr_reader():
-    """Return the singleton EasyOCR Reader, initialising it if necessary."""
-    global _easyocr_reader, _easyocr_init_failed
+    """Return the singleton EasyOCR Reader, initialising it if necessary with retry support."""
+    global _easyocr_reader, _ocr_ready
     if _easyocr_reader is not None:
         return _easyocr_reader
-    if _easyocr_init_failed:
-        return None
 
     with _easyocr_lock:
-        # Double-checked locking
+        # Double-checked locking without permanent failure lock out
         if _easyocr_reader is not None:
             return _easyocr_reader
-        if _easyocr_init_failed:
-            return None
         try:
             import easyocr
             import torch
+            logger.info(f"EASYOCR MODEL DIR: {MODEL_DIR}")
+            logger.info(f"Initialising EasyOCR reader with model directory: {MODEL_DIR}")
             with torch.no_grad():
                 _easyocr_reader = easyocr.Reader(
                     ['en'],
                     gpu=False,
-                    verbose=False,
+                    verbose=True,
                     quantize=True,          # FP16 quantised CRNN — faster on CPU
+                    model_storage_directory=MODEL_DIR,
+                    user_network_directory=MODEL_DIR,
+                    download_enabled=True,
                 )
             gc.collect()
+            _ocr_ready = True
             logger.info("EasyOCR Reader initialised successfully (quantized CPU mode).")
         except Exception as e:
-            logger.warning(f"EasyOCR initialisation failed: {e}")
-            _easyocr_init_failed = True
+            logger.error(f"EasyOCR initialisation error: {e}", exc_info=True)
+            _easyocr_reader = None
+            _ocr_ready = False
     return _easyocr_reader
 
 
@@ -85,15 +99,24 @@ def preprocess_image_fast(image_path: str,
     Read image and resize (downscale only) to target_max_dim while keeping
     aspect ratio. Supports JPG, PNG, WEBP, BMP via OpenCV + PIL fallback.
     Returns (optimised_image, scale_factor).
+    Raises ValueError("Unable to decode uploaded image") if decoding fails.
     """
+    if not os.path.exists(image_path):
+        raise ValueError("Unable to decode uploaded image")
+
     img = cv2.imread(image_path)
     if img is None:
         try:
             from PIL import Image
-            pil_img = Image.open(image_path).convert("RGB")
-            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            with Image.open(image_path) as pil_img:
+                pil_img = pil_img.convert("RGB")
+                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         except Exception as err:
-            raise ValueError(f"Could not read image file: {image_path} ({err})")
+            logger.error(f"PIL fallback failed to read image {image_path}: {err}")
+            img = None
+
+    if img is None or img.size == 0 or len(img.shape) < 2:
+        raise ValueError("Unable to decode uploaded image")
 
     h, w = img.shape[:2]
     max_dim = max(h, w)

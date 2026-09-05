@@ -21,6 +21,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
 ENV OPENBLAS_NUM_THREADS=1
+ENV EASYOCR_MODEL_DIR=/app/models/easyocr
+
+# Create application model and upload directories
+RUN mkdir -p /app/models/easyocr /app/uploads
 
 # Copy application code
 COPY . .

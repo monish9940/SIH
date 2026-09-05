@@ -6,10 +6,11 @@ import os
 import shutil
 import time
 import logging
+from starlette.concurrency import run_in_threadpool
 from app.database import get_database
 from app.config import settings
 from app.services.auth_service import get_current_user
-from app.services.ocr_service import run_ocr, run_ocr_with_metrics, extract_structured_fields
+from app.services.ocr_service import run_ocr, run_ocr_with_metrics, extract_structured_fields, preprocess_image_fast, get_easyocr_reader, is_ocr_ready
 from app.services.compliance_engine import evaluate_compliance
 from app.services.pdf_service import generate_inspection_pdf
 
@@ -73,6 +74,15 @@ async def analyze_inspection(
     inspection_id: str,
     user: dict = Depends(get_current_user)
 ):
+    t_start = time.time()
+    logger = logging.getLogger("inspections_router")
+    logger.info(f"START ANALYZE [{inspection_id}] | elapsed: 0.000s")
+
+    # Readiness guard: never initialize EasyOCR inside an HTTP request
+    if not is_ocr_ready():
+        logger.warning(f"OCR engine is not ready for inspection [{inspection_id}]")
+        raise HTTPException(status_code=503, detail="OCR engine is not ready. Please retry shortly.")
+
     user_id = user["user_id"]
     db = get_database()
 
@@ -85,112 +95,127 @@ async def analyze_inspection(
         raise HTTPException(status_code=403, detail="Forbidden: You are not authorized to analyze this inspection record.")
 
     filepath = inspection["image_path"]
+    logger.info(f"FILE RECEIVED [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+
     if not os.path.exists(filepath):
         raise HTTPException(status_code=400, detail="Inspection image file missing on server.")
 
-    logger = logging.getLogger("inspections_router")
-    logger.info(f"Processing inspection analysis [{inspection_id}] for image: {filepath}")
+    logger.info(f"FILE SAVED [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
 
-    t_total_start = time.time()
+    try:
+        # Preprocess / Decode check
+        logger.info(f"IMAGE DECODE [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+        logger.info(f"PREPROCESS START [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+        t_prep_start = time.time()
+        # Verify decoding first (will raise ValueError if invalid)
+        _, _ = preprocess_image_fast(filepath)
+        t_prep_end = time.time()
+        logger.info(f"PREPROCESS END [{inspection_id}] | duration: {t_prep_end - t_prep_start:.3f}s | elapsed: {time.time() - t_start:.3f}s")
 
-    # 1. OCR Execution with Stage Metrics
-    raw_text, ocr_conf, ocr_metrics = run_ocr_with_metrics(filepath)
+        # Reader Ready Check (uses already initialized singleton)
+        logger.info(f"OCR READER READY [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+        logger.info(f"OCR READER STATE: READY [{inspection_id}]")
 
-    # 2. Structured Field Extraction
-    t_ext_start = time.time()
-    extracted_fields = extract_structured_fields(raw_text, inspection.get("filename", ""))
-    t_ext_end = time.time()
-    field_ext_sec = round(t_ext_end - t_ext_start, 4)
+        # OCR Execution offloaded to worker thread pool
+        logger.info(f"OCR START [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+        t_ocr_start = time.time()
+        raw_text, ocr_conf, ocr_metrics = await run_in_threadpool(run_ocr_with_metrics, filepath)
+        t_ocr_end = time.time()
+        logger.info(f"OCR END [{inspection_id}] | duration: {t_ocr_end - t_ocr_start:.3f}s | elapsed: {time.time() - t_start:.3f}s")
 
-    p_name = extracted_fields.get("product_name", {}).get("value") if isinstance(extracted_fields.get("product_name"), dict) else extracted_fields.get("product_name")
-    p_net = extracted_fields.get("net_quantity", {}).get("value") if isinstance(extracted_fields.get("net_quantity"), dict) else extracted_fields.get("net_quantity")
-    p_mrp = extracted_fields.get("mrp", {}).get("value") if isinstance(extracted_fields.get("mrp"), dict) else extracted_fields.get("mrp")
-    p_mfg = extracted_fields.get("manufacturing_date", {}).get("value") if isinstance(extracted_fields.get("manufacturing_date"), dict) else extracted_fields.get("manufacturing_date")
-    p_mfr = extracted_fields.get("manufacturer", {}).get("value") if isinstance(extracted_fields.get("manufacturer"), dict) else extracted_fields.get("manufacturer")
-    p_care = extracted_fields.get("consumer_care", {}).get("value") if isinstance(extracted_fields.get("consumer_care"), dict) else extracted_fields.get("consumer_care")
-    p_origin = extracted_fields.get("country_of_origin", {}).get("value") if isinstance(extracted_fields.get("country_of_origin"), dict) else extracted_fields.get("country_of_origin")
+        # Structured Field Extraction
+        logger.info(f"STRUCTURED EXTRACTION START [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+        t_ext_start = time.time()
+        extracted_fields = extract_structured_fields(raw_text, inspection.get("filename", ""))
+        t_ext_end = time.time()
+        logger.info(f"STRUCTURED EXTRACTION END [{inspection_id}] | duration: {t_ext_end - t_ext_start:.3f}s | elapsed: {time.time() - t_start:.3f}s")
 
-    # 3. Rule Engine Evaluation
-    t_comp_start = time.time()
-    comp_result = evaluate_compliance(extracted_fields)
-    t_comp_end = time.time()
-    comp_eng_sec = round(t_comp_end - t_comp_start, 4)
+        p_name = extracted_fields.get("product_name", {}).get("value") if isinstance(extracted_fields.get("product_name"), dict) else extracted_fields.get("product_name")
+        p_net = extracted_fields.get("net_quantity", {}).get("value") if isinstance(extracted_fields.get("net_quantity"), dict) else extracted_fields.get("net_quantity")
+        p_mrp = extracted_fields.get("mrp", {}).get("value") if isinstance(extracted_fields.get("mrp"), dict) else extracted_fields.get("mrp")
+        p_mfg = extracted_fields.get("manufacturing_date", {}).get("value") if isinstance(extracted_fields.get("manufacturing_date"), dict) else extracted_fields.get("manufacturing_date")
+        p_mfr = extracted_fields.get("manufacturer", {}).get("value") if isinstance(extracted_fields.get("manufacturer"), dict) else extracted_fields.get("manufacturer")
+        p_care = extracted_fields.get("consumer_care", {}).get("value") if isinstance(extracted_fields.get("consumer_care"), dict) else extracted_fields.get("consumer_care")
+        p_origin = extracted_fields.get("country_of_origin", {}).get("value") if isinstance(extracted_fields.get("country_of_origin"), dict) else extracted_fields.get("country_of_origin")
 
-    # 4. MongoDB Persistence
-    t_mongo_start = time.time()
-    ocr_doc = {
-        "ocr_id": str(uuid4()),
-        "inspection_id": inspection_id,
-        "user_id": user_id,
-        "raw_text": raw_text,
-        "ocr_confidence": ocr_conf,
-        "structured_fields": extracted_fields,
-        "created_at": datetime.utcnow()
-    }
-    await db.ocr_results.insert_one(ocr_doc)
+        # Compliance Engine Evaluation
+        logger.info(f"COMPLIANCE START [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+        t_comp_start = time.time()
+        comp_result = evaluate_compliance(extracted_fields)
+        t_comp_end = time.time()
+        logger.info(f"COMPLIANCE END [{inspection_id}] | duration: {t_comp_end - t_comp_start:.3f}s | elapsed: {time.time() - t_start:.3f}s")
 
-    comp_doc = {
-        "compliance_id": str(uuid4()),
-        "inspection_id": inspection_id,
-        "user_id": user_id,
-        "score": comp_result["score"],
-        "status": comp_result["overall_status"],
-        "checks": comp_result["checks"],
-        "violations": comp_result["violations"],
-        "warnings": comp_result["warnings"],
-        "rule_versions_used": comp_result["rule_versions_used"],
-        "created_at": datetime.utcnow()
-    }
-    await db.compliance_results.insert_one(comp_doc)
+        # MongoDB Persistence
+        logger.info(f"MONGODB SAVE START [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+        t_mongo_start = time.time()
+        ocr_doc = {
+            "ocr_id": str(uuid4()),
+            "inspection_id": inspection_id,
+            "user_id": user_id,
+            "raw_text": raw_text,
+            "ocr_confidence": ocr_conf,
+            "structured_fields": extracted_fields,
+            "created_at": datetime.utcnow()
+        }
+        await db.ocr_results.insert_one(ocr_doc)
 
-    product_info = {
-        "product_name": p_name or "Not detected in uploaded image",
-        "commodity": inspection.get("commodity_type", "Pre-packaged Goods"),
-        "net_quantity": p_net or "Not detected in uploaded image",
-        "mrp": p_mrp or "Not detected in uploaded image",
-        "mfg_date": p_mfg or "Not detected in uploaded image",
-        "manufacturer": p_mfr or "Not detected in uploaded image",
-        "consumer_care": p_care or "Not detected in uploaded image",
-        "country_of_origin": p_origin or "Not detected in uploaded image"
-    }
+        comp_doc = {
+            "compliance_id": str(uuid4()),
+            "inspection_id": inspection_id,
+            "user_id": user_id,
+            "score": comp_result["score"],
+            "status": comp_result["overall_status"],
+            "checks": comp_result["checks"],
+            "violations": comp_result["violations"],
+            "warnings": comp_result["warnings"],
+            "rule_versions_used": comp_result["rule_versions_used"],
+            "created_at": datetime.utcnow()
+        }
+        await db.compliance_results.insert_one(comp_doc)
 
-    update_fields = {
-        "product_information": product_info,
-        "ocr_result": raw_text,
-        "ocr_confidence": ocr_conf,
-        "compliance_checks": comp_result["checks"],
-        "compliance_score": comp_result["score"],
-        "overall_status": comp_result["overall_status"],
-        "status": comp_result["overall_status"],
-        "violations": comp_result["violations"],
-        "warnings": comp_result["warnings"],
-        "analyzed": True,
-        "updated_at": datetime.utcnow()
-    }
+        product_info = {
+            "product_name": p_name or "Not detected in uploaded image",
+            "commodity": inspection.get("commodity_type", "Pre-packaged Goods"),
+            "net_quantity": p_net or "Not detected in uploaded image",
+            "mrp": p_mrp or "Not detected in uploaded image",
+            "mfg_date": p_mfg or "Not detected in uploaded image",
+            "manufacturer": p_mfr or "Not detected in uploaded image",
+            "consumer_care": p_care or "Not detected in uploaded image",
+            "country_of_origin": p_origin or "Not detected in uploaded image"
+        }
 
-    await db.inspections.update_one({"inspection_id": inspection_id}, {"$set": update_fields})
-    t_mongo_end = time.time()
-    mongo_sec = round(t_mongo_end - t_mongo_start, 4)
+        update_fields = {
+            "product_information": product_info,
+            "ocr_result": raw_text,
+            "ocr_confidence": ocr_conf,
+            "compliance_checks": comp_result["checks"],
+            "compliance_score": comp_result["score"],
+            "overall_status": comp_result["overall_status"],
+            "status": comp_result["overall_status"],
+            "violations": comp_result["violations"],
+            "warnings": comp_result["warnings"],
+            "analyzed": True,
+            "updated_at": datetime.utcnow()
+        }
 
-    t_total_end = time.time()
-    total_sec = round(t_total_end - t_total_start, 4)
+        await db.inspections.update_one({"inspection_id": inspection_id}, {"$set": update_fields})
+        t_mongo_end = time.time()
+        logger.info(f"MONGODB SAVE END [{inspection_id}] | duration: {t_mongo_end - t_mongo_start:.3f}s | elapsed: {time.time() - t_start:.3f}s")
 
-    # Required Stage Timing Log Profile
-    logger.info(f"==========================================================")
-    logger.info(f"TIMING DIAGNOSTIC PROFILE FOR INSPECTION [{inspection_id}]")
-    logger.info(f"Image upload/reading:      {ocr_metrics.get('image_read_sec', 0)} seconds")
-    logger.info(f"OCR model loading:         {ocr_metrics.get('model_init_sec', 0)} seconds")
-    logger.info(f"OCR inference:             {ocr_metrics.get('ocr_inference_sec', 0)} seconds (Passes: {ocr_metrics.get('num_passes', 1)})")
-    logger.info(f"OCR text post-processing:  {ocr_metrics.get('ocr_postproc_sec', 0)} seconds")
-    logger.info(f"Field extraction:          {field_ext_sec} seconds")
-    logger.info(f"Compliance engine:         {comp_eng_sec} seconds")
-    logger.info(f"MongoDB:                   {mongo_sec} seconds")
-    logger.info(f"TOTAL:                     {total_sec} seconds")
-    logger.info(f"==========================================================")
+        logger.info(f"RESPONSE READY [{inspection_id}] | TOTAL DURATION: {time.time() - t_start:.3f}s")
 
-    updated_doc = await db.inspections.find_one({"inspection_id": inspection_id})
-    updated_doc.pop("_id", None)
-    return updated_doc
+        updated_doc = await db.inspections.find_one({"inspection_id": inspection_id})
+        updated_doc.pop("_id", None)
+        return updated_doc
+
+    except ValueError as ve:
+        logger.warning(f"Validation error analyzing inspection [{inspection_id}]: {ve}")
+        raise HTTPException(status_code=400, detail="Unable to decode uploaded image" if "Unable to decode" in str(ve) else str(ve))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error analyzing inspection [{inspection_id}]: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Analysis processing failed: {str(exc)}")
 
 @router.get("")
 async def list_inspections(

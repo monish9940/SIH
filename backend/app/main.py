@@ -1,9 +1,14 @@
+import sys
+import os
+# Ensure root backend directory is in sys.path when script is executed directly
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-import os
+import time
 import logging
 import traceback
 
@@ -16,12 +21,23 @@ logger = logging.getLogger("main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Connecting to MongoDB Atlas...")
     await connect_to_mongo()
-    try:
-        from app.services.ocr_service import get_easyocr_reader
-        get_easyocr_reader()
-    except Exception as err:
-        logger.warning(f"EasyOCR prewarm warning: {err}")
+    logger.info("MongoDB Atlas connected successfully.")
+
+    logger.info("EASYOCR PREWARM START")
+    t0 = time.perf_counter()
+    from app.services.ocr_service import get_easyocr_reader
+    reader = get_easyocr_reader()
+    duration = time.perf_counter() - t0
+
+    if reader is None:
+        logger.error("EASYOCR PREWARM FAILED")
+        raise RuntimeError("EasyOCR prewarm failed during application startup.")
+
+    logger.info(f"EASYOCR PREWARM COMPLETE | duration={duration:.2f}s")
+    logger.info("EASYOCR READER READY")
+    logger.info("APPLICATION STARTUP COMPLETE")
     yield
     await close_mongo_connection()
 
@@ -45,6 +61,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 # CORS setup: explicitly allow production Vercel frontend, preview branches, and local dev
 allowed_origins = [
     "https://sih-phi-lilac.vercel.app",
+    "https://sih-hck9nitc4-monish-2dcf.vercel.app",
     "http://localhost:5173",
     "http://localhost:3000",
     "http://127.0.0.1:5173",
@@ -85,4 +102,13 @@ async def root():
 @app.get("/health")
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok"}
+    from app.services.ocr_service import is_ocr_ready
+    return {
+        "status": "ok",
+        "ocr_ready": is_ocr_ready()
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
