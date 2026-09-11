@@ -1,17 +1,7 @@
 import axios from 'axios';
 
-const rawEnv = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || 'https://sih-b9dp.onrender.com';
+const rawEnv = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 let targetHost = rawEnv.trim().replace(/\/+$/, '');
-
-// Ensure HTTPS scheme for production remote hosts to prevent Mixed Content security blocks
-if (targetHost.includes('onrender.com') && targetHost.startsWith('http://')) {
-  targetHost = targetHost.replace('http://', 'https://');
-}
-
-// Fallback to live production backend if local URL is evaluated on a production browser origin
-if ((targetHost.includes('localhost') || targetHost.includes('127.0.0.1')) && typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-  targetHost = 'https://sih-b9dp.onrender.com';
-}
 
 // Construct clean baseURL without duplicate /api suffix
 const baseURL = targetHost.endsWith('/api') ? targetHost : `${targetHost}/api`;

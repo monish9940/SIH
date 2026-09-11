@@ -1,0 +1,9 @@
+Starting Real-World Validation...
+
+================================================================================
+TEST IMAGE: INSP-2026-09826A48.jpg
+Description: Scenario 1: Large clear product label
+  Dimensions: 600x400 | Format: JPEG | Size: 28453 bytes
+  - OCR Method Used:      fullimage
+  - OCR Inference Time:  5651.40 ms
+  - Total Analysis Time: 14704.65 ms

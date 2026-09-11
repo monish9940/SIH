@@ -8,6 +8,7 @@ import shutil
 import time
 import logging
 import asyncio
+import hashlib
 from starlette.concurrency import run_in_threadpool
 from app.database import get_database
 from app.config import settings
@@ -21,6 +22,16 @@ router = APIRouter(prefix="/api/inspections", tags=["Inspections"])
 # Global strong-reference set to prevent background asyncio tasks from being garbage-collected
 _background_tasks: set = set()
 
+# Bounded Concurrency Semaphore for OCR
+_ocr_semaphore = asyncio.Semaphore(settings.OCR_MAX_CONCURRENT_TASKS)
+
+def get_image_hash(filepath: str) -> str:
+    hasher = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(8192):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
 async def run_background_analysis(inspection_id: str, user_id: str, filepath: str, filename: str, commodity_type: str):
     logger = logging.getLogger("inspections_router")
     t_start = time.time()
@@ -30,12 +41,31 @@ async def run_background_analysis(inspection_id: str, user_id: str, filepath: st
         # 1. Preprocess / Decode check
         _, _ = await run_in_threadpool(preprocess_image_fast, filepath)
 
-        # 2. OCR Execution
-        logger.info(f"OCR START [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
-        t_ocr_start = time.time()
-        raw_text, ocr_conf, ocr_metrics = await run_in_threadpool(run_ocr_with_metrics, filepath)
-        t_ocr_end = time.time()
-        logger.info(f"OCR END [{inspection_id}] | duration: {t_ocr_end - t_ocr_start:.3f}s | elapsed: {time.time() - t_start:.3f}s")
+        # 1.5 Duplicate Image Cache Check (Per-User)
+        logger.info(f"HASHING IMAGE [{inspection_id}]")
+        img_hash = get_image_hash(filepath)
+        
+        # Look for a successful past OCR result with this exact image hash for this specific user
+        cached_ocr = await db.ocr_results.find_one({
+            "image_hash": img_hash,
+            "user_id": user_id,
+            "ocr_confidence": {"$gt": 0}
+        }, sort=[("created_at", -1)])
+        
+        if cached_ocr and cached_ocr.get("raw_text"):
+            logger.info(f"CACHE HIT [{inspection_id}] | Found existing OCR result for user.")
+            raw_text = cached_ocr.get("raw_text")
+            ocr_conf = cached_ocr.get("ocr_confidence")
+            ocr_metrics = {"cached": True, "num_passes": 0, "ocr_inference_sec": 0}
+        else:
+            # 2. OCR Execution (Bounded Concurrency)
+            logger.info(f"WAITING FOR OCR SEMAPHORE [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+            async with _ocr_semaphore:
+                logger.info(f"OCR START [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
+                t_ocr_start = time.time()
+                raw_text, ocr_conf, ocr_metrics = await run_in_threadpool(run_ocr_with_metrics, filepath)
+                t_ocr_end = time.time()
+                logger.info(f"OCR END [{inspection_id}] | duration: {t_ocr_end - t_ocr_start:.3f}s | elapsed: {time.time() - t_start:.3f}s")
 
         # 3. Structured Field Extraction
         logger.info(f"STRUCTURED EXTRACTION START [{inspection_id}] | elapsed: {time.time() - t_start:.3f}s")
@@ -69,6 +99,7 @@ async def run_background_analysis(inspection_id: str, user_id: str, filepath: st
             "raw_text": raw_text,
             "ocr_confidence": ocr_conf,
             "structured_fields": extracted_fields,
+            "image_hash": img_hash,
             "created_at": datetime.utcnow()
         }
         await db.ocr_results.insert_one(ocr_doc)
@@ -117,6 +148,21 @@ async def run_background_analysis(inspection_id: str, user_id: str, filepath: st
 
         await db.inspections.update_one({"inspection_id": inspection_id}, {"$set": update_fields})
         t_mongo_end = time.time()
+        
+        # Structured performance summary
+        total_time = time.time() - t_start
+        logger.info(
+            f"\nOCR Performance [{inspection_id}]\n"
+            f"Preprocessing: {ocr_metrics.get('image_read_sec', 0.0):.3f}s\n"
+            f"OCR initialization: {ocr_metrics.get('model_init_sec', 0.0):.3f}s\n"
+            f"OCR inference: {ocr_metrics.get('ocr_inference_sec', 0.0):.3f}s\n"
+            f"Post-processing: {ocr_metrics.get('ocr_postproc_sec', 0.0):.3f}s\n"
+            f"Field extraction: {t_ext_end - t_ext_start:.3f}s\n"
+            f"Compliance engine: {t_comp_end - t_comp_start:.3f}s\n"
+            f"MongoDB save: {t_mongo_end - t_mongo_start:.3f}s\n"
+            f"Total analysis: {total_time:.3f}s\n"
+        )
+        
         logger.info(f"MONGODB SAVE END [{inspection_id}] | duration: {t_mongo_end - t_mongo_start:.3f}s | elapsed: {time.time() - t_start:.3f}s")
         logger.info(f"BACKGROUND ANALYSIS COMPLETE [{inspection_id}] | TOTAL DURATION: {time.time() - t_start:.3f}s")
 

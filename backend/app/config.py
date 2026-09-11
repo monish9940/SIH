@@ -14,6 +14,15 @@ class Settings(BaseSettings):
     PORT: int = int(os.getenv("PORT", "8090"))
     NODE_ENV: str = os.getenv("NODE_ENV", "development")
 
+    # OCR and Performance settings
+    OCR_USE_GPU: bool = os.getenv("OCR_USE_GPU", "false").lower() == "true"
+    OCR_CPU_THREADS: int = int(os.getenv("OCR_CPU_THREADS", "2"))
+    OCR_MAX_IMAGE_DIM: int = int(os.getenv("OCR_MAX_IMAGE_DIM", "1400"))
+    OCR_CONFIDENCE_THRESHOLD: float = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.50"))
+    OCR_ENABLE_FALLBACK: bool = os.getenv("OCR_ENABLE_FALLBACK", "true").lower() == "true"
+    OCR_MAX_CONCURRENT_TASKS: int = int(os.getenv("OCR_MAX_CONCURRENT_TASKS", "2"))
+    OCR_REGION_AWARE: bool = os.getenv("OCR_REGION_AWARE", "true").lower() == "true"
+
     class Config:
         env_file = ".env"
         extra = "ignore"

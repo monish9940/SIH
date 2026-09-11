@@ -6,19 +6,20 @@ import time
 import logging
 import threading
 import gc
+from app.config import settings
 
 logger = logging.getLogger("ocr_service")
 
 # ──────────────────────────────────────────────
 # CPU Thread tuning (PyTorch / BLAS)
-# Enforce single-thread execution to minimize memory allocation overhead
+# Configure via settings to prevent excessive memory allocation overhead
 # ──────────────────────────────────────────────
 try:
     import torch
-    torch.set_num_threads(1)
+    torch.set_num_threads(settings.OCR_CPU_THREADS)
     if hasattr(torch, "set_num_interop_threads"):
         try:
-            torch.set_num_interop_threads(1)
+            torch.set_num_interop_threads(settings.OCR_CPU_THREADS)
         except Exception:
             pass
 except Exception:
@@ -42,12 +43,377 @@ except Exception:
     pass
 
 # ── Performance constants ─────────────────────────────────────────────────
-_TARGET_MAX_DIM   = 1400   # Max dimension for fast image downscaling
+_TARGET_MAX_DIM   = settings.OCR_MAX_IMAGE_DIM   # Max dimension for fast image downscaling
 _CANVAS_SIZE      = 1024   # EasyOCR internal canvas size for CPU processing
-# Pass-2 (CLAHE) is expensive (~same cost as pass 1). Only trigger it for
-# genuinely poor captures: very few blocks AND very low confidence.
-_FALLBACK_CONF    = 0.45   # dramatically reduces unnecessary double-passes
+_FALLBACK_CONF    = settings.OCR_CONFIDENCE_THRESHOLD
 _FALLBACK_MIN_BLOCKS = 3   # only retry if almost nothing was detected
+_REGION_AWARE     = settings.OCR_REGION_AWARE     # Enable region-aware OCR pipeline
+
+# ── Region-aware OCR constants ────────────────────────────────────────────
+_MIN_REGION_AREA_RATIO = 0.002   # Minimum region area as fraction of image area
+_REGION_PADDING_FRAC   = 0.08    # Padding around detected regions (fraction of region size)
+_REGION_MERGE_GAP      = 25      # Pixels: merge regions closer than this
+_MIN_IMAGE_AREA_FOR_REGIONS = 200 * 200  # Only use region detection on images large enough
+_LOW_CONF_THRESHOLD    = 0.55    # Regions below this get selective reprocessing
+_MIN_REGIONS_FOR_BENEFIT = 2     # Need at least this many regions for region-OCR to help
+
+
+# ──────────────────────────────────────────────
+# Region Detection (lightweight OpenCV, no ML)
+# ──────────────────────────────────────────────
+def _detect_text_regions(img: np.ndarray) -> list[dict]:
+    """
+    Detect likely text-containing regions using lightweight OpenCV techniques.
+    Returns list of region dicts with keys: x, y, w, h, area, label.
+
+    Strategy:
+    1. Convert to grayscale and apply adaptive threshold
+    2. Morphological close to connect nearby text characters into blocks
+    3. Find contours of connected components
+    4. Filter out non-text regions (barcodes, blanks, tiny noise)
+    """
+    h, w = img.shape[:2]
+    img_area = h * w
+
+    # Grayscale + bilateral filter (preserves edges, smooths noise)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
+
+    # Adaptive threshold to highlight text against background
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, blockSize=15, C=8
+    )
+
+    # Morphological close: connect nearby text characters into blocks
+    # Use a wide horizontal kernel to merge characters on the same line
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(w // 15, 12), 3))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_h)
+
+    # Vertical dilation to merge lines that are close vertically
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(h // 40, 5)))
+    closed = cv2.dilate(closed, kernel_v, iterations=2)
+
+    # Find contours of the connected regions
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    regions = []
+    min_area = img_area * _MIN_REGION_AREA_RATIO
+
+    for cnt in contours:
+        x, y, rw, rh = cv2.boundingRect(cnt)
+        area = rw * rh
+
+        # Filter: too small (noise)
+        if area < min_area:
+            continue
+
+        # Filter: too narrow or too short (decorative lines/borders)
+        if rw < 15 or rh < 8:
+            continue
+
+        # Filter: extreme aspect ratio — likely barcode (very tall & narrow vertical lines)
+        aspect = rw / max(rh, 1)
+        if aspect > 20 or aspect < 0.05:
+            continue
+
+        # Filter: barcode detection — check for high-frequency vertical edges in the region
+        if _is_barcode_region(gray, x, y, rw, rh):
+            continue
+
+        # Filter: blank region — very low pixel density in the binary mask
+        region_binary = binary[y:y+rh, x:x+rw]
+        pixel_density = np.count_nonzero(region_binary) / max(area, 1)
+        if pixel_density < 0.02:
+            continue
+
+        # Classify region by vertical position
+        cy = y + rh / 2
+        vert_pos = cy / h
+        if vert_pos < 0.20:
+            label = "product_name"
+        elif vert_pos < 0.45:
+            label = "declarations"
+        elif vert_pos < 0.65:
+            label = "pricing_ingredients"
+        elif vert_pos < 0.80:
+            label = "manufacturer"
+        else:
+            label = "fssai_consumer_care"
+
+        regions.append({
+            "x": x, "y": y, "w": rw, "h": rh,
+            "area": area, "label": label,
+            "vert_pos": vert_pos,
+        })
+
+    return regions
+
+
+def _is_barcode_region(gray: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
+    """Quick heuristic: barcodes have high-frequency vertical edge patterns."""
+    if w < 30 or h < 20:
+        return False
+    crop = gray[y:y+h, x:x+w]
+    # Sobel vertical edges
+    sobel_x = cv2.Sobel(crop, cv2.CV_64F, 1, 0, ksize=3)
+    # Count zero-crossings (alternating black/white bars)
+    sign_changes = np.sum(np.diff(np.sign(sobel_x.mean(axis=0))) != 0)
+    # Barcodes have many alternating edges relative to width
+    return sign_changes > w * 0.3
+
+
+def _merge_nearby_regions(regions: list[dict], gap: int = _REGION_MERGE_GAP) -> list[dict]:
+    """Merge overlapping or nearby regions to reduce number of OCR calls."""
+    if not regions:
+        return []
+
+    # Sort by y then x
+    regions = sorted(regions, key=lambda r: (r["y"], r["x"]))
+    merged = [regions[0].copy()]
+
+    for r in regions[1:]:
+        last = merged[-1]
+        # Check if regions overlap or are within gap distance
+        overlap_x = (r["x"] <= last["x"] + last["w"] + gap) and (r["x"] + r["w"] >= last["x"] - gap)
+        overlap_y = (r["y"] <= last["y"] + last["h"] + gap) and (r["y"] + r["h"] >= last["y"] - gap)
+
+        if overlap_x and overlap_y:
+            # Merge: expand the last region to encompass both
+            new_x = min(last["x"], r["x"])
+            new_y = min(last["y"], r["y"])
+            new_x2 = max(last["x"] + last["w"], r["x"] + r["w"])
+            new_y2 = max(last["y"] + last["h"], r["y"] + r["h"])
+            last["x"] = new_x
+            last["y"] = new_y
+            last["w"] = new_x2 - new_x
+            last["h"] = new_y2 - new_y
+            last["area"] = last["w"] * last["h"]
+            # Keep the label of the larger region
+            if r["area"] > last["area"]:
+                last["label"] = r["label"]
+        else:
+            merged.append(r.copy())
+
+    return merged
+
+
+def _pad_region(region: dict, img_h: int, img_w: int) -> dict:
+    """Add padding around a region, clamped to image bounds."""
+    r = region.copy()
+    pad_x = int(r["w"] * _REGION_PADDING_FRAC)
+    pad_y = int(r["h"] * _REGION_PADDING_FRAC)
+    # Minimum padding of 5 pixels
+    pad_x = max(pad_x, 5)
+    pad_y = max(pad_y, 5)
+
+    r["x"] = max(0, r["x"] - pad_x)
+    r["y"] = max(0, r["y"] - pad_y)
+    r["w"] = min(img_w - r["x"], r["w"] + 2 * pad_x)
+    r["h"] = min(img_h - r["y"], r["h"] + 2 * pad_y)
+    return r
+
+
+def _run_region_ocr(reader, img: np.ndarray, regions: list[dict]) -> list[dict]:
+    """
+    Run EasyOCR on each region crop and remap bounding boxes to full-image coords.
+    Returns combined list of parsed blocks (same format as parse_easyocr_blocks output).
+    """
+    import torch
+    all_blocks = []
+
+    for region in regions:
+        x, y, w, h = region["x"], region["y"], region["w"], region["h"]
+        crop = img[y:y+h, x:x+w]
+
+        if crop.size == 0 or crop.shape[0] < 8 or crop.shape[1] < 15:
+            continue
+
+        try:
+            with torch.no_grad():
+                results = reader.readtext(
+                    crop,
+                    canvas_size=min(_CANVAS_SIZE, max(w, h) + 100),
+                    detail=1,
+                    text_threshold=0.6,
+                    low_text=0.35,
+                    width_ths=0.7,
+                    workers=0,
+                )
+        except Exception as err:
+            logger.debug(f"Region OCR error at ({x},{y},{w},{h}): {err}")
+            continue
+
+        # Parse and remap coordinates to full-image space
+        for bbox, text, prob in results:
+            text_clean = text.strip()
+            if not text_clean or prob < 0.15:
+                continue
+
+            # Remap bounding box: offset by region origin
+            remapped_bbox = [[pt[0] + x, pt[1] + y] for pt in bbox]
+            xs = [pt[0] for pt in remapped_bbox]
+            ys = [pt[1] for pt in remapped_bbox]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            cy = (min_y + max_y) / 2.0
+            cx = (min_x + max_x) / 2.0
+
+            all_blocks.append({
+                "text":  text_clean,
+                "prob":  float(prob),
+                "bbox":  remapped_bbox,
+                "cy":    cy,
+                "cx":    cx,
+                "min_y": min_y,
+                "max_y": max_y,
+                "min_x": min_x,
+                "max_x": max_x,
+                "mode":  "region",
+                "region_label": region.get("label", "unknown"),
+            })
+
+    return all_blocks
+
+
+def _selective_reprocess(reader, img: np.ndarray, blocks: list[dict],
+                         regions: list[dict]) -> tuple[list[dict], list[str]]:
+    """
+    Confidence-based selective reprocessing: only low-confidence regions get
+    CLAHE enhancement + re-OCR. NOT the entire image.
+    Returns (updated_blocks, list_of_reprocessed_region_labels).
+    """
+    import torch
+
+    # Group blocks by region label and compute per-region confidence
+    region_confs: dict[str, list[float]] = {}
+    for b in blocks:
+        label = b.get("region_label", "unknown")
+        region_confs.setdefault(label, []).append(b["prob"])
+
+    reprocessed = []
+    new_blocks = []
+
+    for region in regions:
+        label = region.get("label", "unknown")
+        confs = region_confs.get(label, [])
+        avg_conf = float(np.mean(confs)) if confs else 0.0
+
+        if avg_conf >= _LOW_CONF_THRESHOLD and len(confs) > 0:
+            # Region is fine — keep existing blocks
+            new_blocks.extend([b for b in blocks if b.get("region_label") == label])
+            continue
+
+        # Low confidence or no blocks — reprocess this region with CLAHE
+        x, y, w, h = region["x"], region["y"], region["w"], region["h"]
+        crop = img[y:y+h, x:x+w]
+        if crop.size == 0:
+            new_blocks.extend([b for b in blocks if b.get("region_label") == label])
+            continue
+
+        try:
+            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray_crop)
+            enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+            with torch.no_grad():
+                results = reader.readtext(
+                    enhanced_bgr,
+                    canvas_size=min(_CANVAS_SIZE, max(w, h) + 100),
+                    detail=1,
+                    text_threshold=0.6,
+                    low_text=0.35,
+                    width_ths=0.7,
+                    workers=0,
+                )
+
+            enhanced_blocks = []
+            for bbox, text, prob in results:
+                text_clean = text.strip()
+                if not text_clean or prob < 0.15:
+                    continue
+                remapped_bbox = [[pt[0] + x, pt[1] + y] for pt in bbox]
+                xs_r = [pt[0] for pt in remapped_bbox]
+                ys_r = [pt[1] for pt in remapped_bbox]
+                min_xr, max_xr = min(xs_r), max(xs_r)
+                min_yr, max_yr = min(ys_r), max(ys_r)
+                enhanced_blocks.append({
+                    "text": text_clean, "prob": float(prob),
+                    "bbox": remapped_bbox,
+                    "cy": (min_yr + max_yr) / 2.0,
+                    "cx": (min_xr + max_xr) / 2.0,
+                    "min_y": min_yr, "max_y": max_yr,
+                    "min_x": min_xr, "max_x": max_xr,
+                    "mode": "region_clahe",
+                    "region_label": label,
+                })
+
+            # Use enhanced result only if it's actually better
+            enhanced_avg = float(np.mean([b["prob"] for b in enhanced_blocks])) if enhanced_blocks else 0.0
+            if enhanced_avg > avg_conf or (not confs and enhanced_blocks):
+                new_blocks.extend(enhanced_blocks)
+                reprocessed.append(label)
+            else:
+                new_blocks.extend([b for b in blocks if b.get("region_label") == label])
+
+        except Exception as exc:
+            logger.debug(f"Selective reprocess error for region {label}: {exc}")
+            new_blocks.extend([b for b in blocks if b.get("region_label") == label])
+
+    # Include any blocks that don't belong to a classified region
+    classified_labels = {r.get("label") for r in regions}
+    orphan_blocks = [b for b in blocks if b.get("region_label", "unknown") not in classified_labels]
+    new_blocks.extend(orphan_blocks)
+
+    return new_blocks, reprocessed
+
+
+def _compute_ocr_quality_score(blocks: list[dict], fields: dict,
+                               reprocessed: list[str], method: str) -> dict:
+    """Compute a quality score indicating overall OCR result quality."""
+    # Block count score (0-25)
+    block_score = min(25, len(blocks) * 3)
+
+    # Confidence score (0-35)
+    avg_conf = float(np.mean([b["prob"] for b in blocks])) if blocks else 0.0
+    conf_score = avg_conf * 35
+
+    # Field extraction score (0-40): count how many critical fields were found
+    critical_fields = ["mrp", "net_quantity", "manufacturer", "manufacturing_date",
+                       "product_name", "consumer_care"]
+    fields_found = 0
+    for f in critical_fields:
+        val = fields.get(f, {})
+        if isinstance(val, dict) and val.get("value"):
+            fields_found += 1
+        elif val and not isinstance(val, dict):
+            fields_found += 1
+    field_score = (fields_found / len(critical_fields)) * 40
+
+    total = round(block_score + conf_score + field_score, 1)
+
+    # Grade
+    if total >= 85:
+        grade = "EXCELLENT"
+    elif total >= 70:
+        grade = "GOOD"
+    elif total >= 50:
+        grade = "FAIR"
+    else:
+        grade = "POOR"
+
+    return {
+        "score": total,
+        "grade": grade,
+        "avg_confidence": round(avg_conf, 3),
+        "blocks_detected": len(blocks),
+        "fields_extracted": fields_found,
+        "fields_total": len(critical_fields),
+        "reprocessed_regions": reprocessed,
+        "method": method,
+    }
+
+
 
 
 def is_ocr_ready() -> bool:
@@ -79,7 +445,7 @@ def get_easyocr_reader():
             with torch.no_grad():
                 reader = easyocr.Reader(
                     ['en'],
-                    gpu=False,
+                    gpu=settings.OCR_USE_GPU,
                     verbose=False,
                     quantize=True,
                     model_storage_directory=MODEL_DIR,
@@ -110,6 +476,10 @@ def get_easyocr_reader():
 def preprocess_image_fast(image_path: str,
                            target_max_dim: int = _TARGET_MAX_DIM
                            ) -> tuple[np.ndarray, float]:
+    """Read and downscale image while preserving aspect ratio.
+    Returns the resized image and the scale factor applied.
+    """
+    # Existing implementation unchanged – kept for compatibility
     """
     Read image and resize (downscale only) to target_max_dim while keeping
     aspect ratio. Supports JPG, PNG, WEBP, BMP via OpenCV + PIL fallback.
@@ -147,7 +517,7 @@ def preprocess_image_fast(image_path: str,
 
 
 # ──────────────────────────────────────────────
-# Block / Line Parsing
+# Block / Line Parsing (unchanged)
 # ──────────────────────────────────────────────
 def parse_easyocr_blocks(results, mode: str = "standard") -> list[dict]:
     blocks = []
@@ -212,47 +582,16 @@ def reconstruct_2d_lines(blocks: list[dict]) -> list[str]:
 # ──────────────────────────────────────────────
 # Main OCR Pipeline
 # ──────────────────────────────────────────────
-def run_ocr_with_metrics(image_path: str) -> tuple[str, float, dict]:
+def _run_fullimage_ocr(reader, img_opt: np.ndarray) -> tuple[list[dict], float, float]:
     """
-    Single-pass OCR pipeline with optional CLAHE fallback.
-
-    Returns (full_text, avg_confidence, metrics_dict).
-
-    Timing metrics (all in seconds):
-        image_read_sec       – imread + resize
-        model_init_sec       – first-call model load (0 on warm subsequent calls)
-        ocr_inference_sec    – readtext() wall time (pass 1 + optional pass 2)
-        ocr_postproc_sec     – block merge + line reconstruction
-        num_passes           – 1 or 2
+    Original full-image OCR pipeline (preserved for fallback).
+    Returns (blocks, avg_confidence, inference_seconds).
     """
-    metrics: dict = {}
-
-    # 1. Image read + preprocess
-    t0 = time.time()
-    img_opt, _scale = preprocess_image_fast(image_path, target_max_dim=_TARGET_MAX_DIM)
-    metrics["image_read_sec"] = round(time.time() - t0, 4)
-
-    # 2. Model access (singleton — nearly instant after first call)
-    t0 = time.time()
-    reader = get_easyocr_reader()
-    metrics["model_init_sec"] = round(time.time() - t0, 4)
-
-    if not reader:
-        logger.error("EasyOCR reader unavailable — returning empty OCR result.")
-        metrics.update({"ocr_inference_sec": 0.0, "ocr_postproc_sec": 0.0, "num_passes": 0})
-        return "", 0.0, metrics
-
-    # 3. Pass 1 — OCR on optimised image
-    # Tuned readtext params for CPU speed:
-    #   text_threshold=0.6  – skip very faint text candidates (saves detection time)
-    #   low_text=0.35       – lower sensitivity = fewer false region proposals
-    #   width_ths=0.7       – merge close horizontal boxes (fewer recognition calls)
-    #   workers=0           – disable multiprocessing fork overhead per call
+    import torch
     t0 = time.time()
     try:
-        import torch
         with torch.no_grad():
-            results_p1 = reader.readtext(
+            results = reader.readtext(
                 img_opt,
                 canvas_size=_CANVAS_SIZE,
                 detail=1,
@@ -262,67 +601,266 @@ def run_ocr_with_metrics(image_path: str) -> tuple[str, float, dict]:
                 workers=0,
             )
     except Exception as err:
-        logger.error(f"EasyOCR pass-1 error: {err}")
-        results_p1 = []
-    finally:
-        gc.collect()
-    inf1_sec = time.time() - t0
+        logger.error(f"EasyOCR full-image error: {err}")
+        results = []
+    inf_sec = time.time() - t0
 
-    blocks_p1 = parse_easyocr_blocks(results_p1, mode="standard")
-    avg_conf_p1 = float(np.mean([b["prob"] for b in blocks_p1])) if blocks_p1 else 0.0
+    blocks = parse_easyocr_blocks(results, mode="standard")
+    avg_conf = float(np.mean([b["prob"] for b in blocks])) if blocks else 0.0
+    return blocks, avg_conf, inf_sec
 
-    # 4. Decide whether a second pass is needed.
-    # Only run CLAHE pass for genuinely bad captures (almost nothing detected
-    # AND very low confidence). Most label photos will skip this.
-    need_pass2 = avg_conf_p1 < _FALLBACK_CONF and len(blocks_p1) < _FALLBACK_MIN_BLOCKS
-    inf2_sec = 0.0
-    blocks_p2: list[dict] = []
 
-    if need_pass2:
-        logger.info(
-            f"Pass-1 conf={avg_conf_p1:.2f}, blocks={len(blocks_p1)} "
-            f"→ running CLAHE fallback pass (threshold: conf<{_FALLBACK_CONF} AND blocks<{_FALLBACK_MIN_BLOCKS})."
-        )
-        t0 = time.time()
-        try:
-            gray = cv2.cvtColor(img_opt, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-            enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-            import torch
-            with torch.no_grad():
-                results_p2 = reader.readtext(
-                    enhanced_bgr,
-                    canvas_size=_CANVAS_SIZE,
-                    detail=1,
-                    text_threshold=0.6,
-                    low_text=0.35,
-                    width_ths=0.7,
-                    workers=0,
-                )
-            blocks_p2 = parse_easyocr_blocks(results_p2, mode="clahe")
-        except Exception as exc:
-            logger.debug(f"CLAHE pass error: {exc}")
-        finally:
-            gc.collect()
-        inf2_sec = time.time() - t0
+def run_ocr_with_metrics(image_path: str) -> tuple[str, float, dict]:
+    """
+    Region-aware OCR pipeline with automatic fallback to full-image OCR.
 
-    # 5. Merge blocks and reconstruct text
+    Returns (full_text, avg_confidence, metrics_dict).
+
+    Timing metrics (all in seconds):
+        image_read_sec       – imread + resize
+        model_init_sec       – first-call model load (0 on warm subsequent calls)
+        region_detection_sec – OpenCV region detection time
+        ocr_inference_sec    – readtext() wall time (region or full-image)
+        reprocess_sec        – confidence-based selective reprocessing time
+        ocr_postproc_sec     – block merge + line reconstruction
+        extraction_sec       – structured field extraction time
+        total_sec            – wall-clock total for the entire pipeline
+        num_regions          – how many text regions were detected
+        num_passes           – 1 or 2 (for backward compat)
+        method               – "region" or "fullimage"
+        ocr_quality          – quality score dict
+    """
+    t_total_start = time.time()
+    metrics: dict = {}
+
+    # ── 1. Image read + preprocess ────────────────────────────────────────
     t0 = time.time()
-    combined = blocks_p1 + blocks_p2
-    lines = reconstruct_2d_lines(combined)
+    img_opt, _scale = preprocess_image_fast(image_path, target_max_dim=_TARGET_MAX_DIM)
+    metrics["image_read_sec"] = round(time.time() - t0, 4)
+
+    # ── 2. Model access (singleton) ───────────────────────────────────────
+    t0 = time.time()
+    reader = get_easyocr_reader()
+    metrics["model_init_sec"] = round(time.time() - t0, 4)
+
+    if not reader:
+        logger.error("EasyOCR reader unavailable — returning empty OCR result.")
+        metrics.update({
+            "ocr_inference_sec": 0.0, "ocr_postproc_sec": 0.0,
+            "num_passes": 0, "region_detection_sec": 0.0,
+            "reprocess_sec": 0.0, "extraction_sec": 0.0,
+            "total_sec": 0.0, "num_regions": 0, "method": "none",
+        })
+        return "", 0.0, metrics
+
+    h, w = img_opt.shape[:2]
+    img_area = h * w
+    use_regions = (
+        _REGION_AWARE
+        and img_area >= _MIN_IMAGE_AREA_FOR_REGIONS
+    )
+
+    # ── 3. Region detection (lightweight OpenCV) ──────────────────────────
+    regions = []
+    if use_regions:
+        t0 = time.time()
+        raw_regions = _detect_text_regions(img_opt)
+        merged_regions = _merge_nearby_regions(raw_regions)
+        # Pad regions for OCR margin
+        regions = [_pad_region(r, h, w) for r in merged_regions]
+        metrics["region_detection_sec"] = round(time.time() - t0, 4)
+
+        # Check if region detection found enough distinct regions to be beneficial
+        # If regions cover >90% of image area, full-image OCR is likely faster
+        total_region_area = sum(r["w"] * r["h"] for r in regions)
+        region_coverage = total_region_area / img_area if img_area > 0 else 1.0
+
+        if len(regions) < _MIN_REGIONS_FOR_BENEFIT or region_coverage > 0.90:
+            logger.info(
+                f"Region detection: {len(regions)} regions, coverage={region_coverage:.1%} "
+                f"→ falling back to full-image OCR (insufficient benefit)"
+            )
+            use_regions = False
+            regions = []
+    else:
+        metrics["region_detection_sec"] = 0.0
+
+    # ── 4. OCR execution ──────────────────────────────────────────────────
+    reprocessed_regions: list[str] = []
+    reprocess_sec = 0.0
+
+    if use_regions and regions:
+        # ── 4a. Region-based OCR ──────────────────────────────────────────
+        logger.info(f"Region-aware OCR: {len(regions)} text regions detected")
+        for i, r in enumerate(regions):
+            logger.info(f"  Region {i}: label={r['label']} pos=({r['x']},{r['y']}) size={r['w']}x{r['h']}")
+
+        t0 = time.time()
+        blocks_region = _run_region_ocr(reader, img_opt, regions)
+        region_ocr_sec = time.time() - t0
+        avg_conf_region = float(np.mean([b["prob"] for b in blocks_region])) if blocks_region else 0.0
+
+        # Quick field extraction check on region results
+        temp_lines_r = reconstruct_2d_lines(blocks_region)
+        temp_text_r = "\n".join(temp_lines_r)
+        temp_fields_r = extract_structured_fields(temp_text_r)
+
+        # Count critical fields found
+        critical_keys = ["mrp", "net_quantity", "manufacturer", "manufacturing_date"]
+        region_fields_found = sum(
+            1 for k in critical_keys
+            if isinstance(temp_fields_r.get(k), dict) and temp_fields_r[k].get("value")
+        )
+
+        # ── 4a.1 Selective reprocessing on low-confidence regions ─────────
+        if settings.OCR_ENABLE_FALLBACK and avg_conf_region < _FALLBACK_CONF:
+            t0_rp = time.time()
+            blocks_region, reprocessed_regions = _selective_reprocess(
+                reader, img_opt, blocks_region, regions
+            )
+            reprocess_sec = time.time() - t0_rp
+            if reprocessed_regions:
+                logger.info(f"Selective reprocessing: enhanced {reprocessed_regions}")
+
+        # ── 4a.2 Fallback safety: compare region vs full-image ────────────
+        # If region-OCR found very few blocks or missed critical fields,
+        # run full-image OCR and pick the better result
+        if len(blocks_region) < _FALLBACK_MIN_BLOCKS or region_fields_found < 2:
+            logger.info(
+                f"Region OCR produced {len(blocks_region)} blocks, "
+                f"{region_fields_found} fields → running full-image fallback for comparison"
+            )
+            blocks_full, avg_conf_full, inf_full_sec = _run_fullimage_ocr(reader, img_opt)
+            temp_lines_f = reconstruct_2d_lines(blocks_full)
+            temp_text_f = "\n".join(temp_lines_f)
+            temp_fields_f = extract_structured_fields(temp_text_f)
+            full_fields_found = sum(
+                1 for k in critical_keys
+                if isinstance(temp_fields_f.get(k), dict) and temp_fields_f[k].get("value")
+            )
+
+            # Use whichever result extracted more critical fields (accuracy > speed)
+            if full_fields_found > region_fields_found or (
+                full_fields_found == region_fields_found and avg_conf_full > avg_conf_region
+            ):
+                logger.info(
+                    f"Full-image OCR better: {full_fields_found} fields vs {region_fields_found} "
+                    f"→ using full-image result"
+                )
+                blocks = blocks_full
+                metrics["ocr_inference_sec"] = round(region_ocr_sec + reprocess_sec + inf_full_sec, 4)
+                metrics["method"] = "fullimage_fallback"
+                metrics["num_regions"] = len(regions)
+            else:
+                blocks = blocks_region
+                metrics["ocr_inference_sec"] = round(region_ocr_sec + reprocess_sec, 4)
+                metrics["method"] = "region"
+                metrics["num_regions"] = len(regions)
+        else:
+            blocks = blocks_region
+            metrics["ocr_inference_sec"] = round(region_ocr_sec + reprocess_sec, 4)
+            metrics["method"] = "region"
+            metrics["num_regions"] = len(regions)
+
+    else:
+        # ── 4b. Full-image OCR (original pipeline) ────────────────────────
+        blocks_p1, avg_conf_p1, inf1_sec = _run_fullimage_ocr(reader, img_opt)
+
+        # Quick field extraction check
+        temp_lines = reconstruct_2d_lines(blocks_p1)
+        temp_text = "\n".join(temp_lines)
+        preliminary_fields = extract_structured_fields(temp_text)
+
+        mrp_found = bool(preliminary_fields.get("mrp", {}).get("value"))
+        net_qty_found = bool(preliminary_fields.get("net_quantity", {}).get("value"))
+        mfr_found = bool(preliminary_fields.get("manufacturer", {}).get("value"))
+        important_fields_found = (mrp_found and net_qty_found) or (mrp_found and mfr_found)
+
+        # CLAHE fallback (existing logic, unchanged)
+        need_pass2 = (
+            settings.OCR_ENABLE_FALLBACK
+            and not important_fields_found
+            and (avg_conf_p1 < _FALLBACK_CONF or len(blocks_p1) < _FALLBACK_MIN_BLOCKS)
+        )
+        inf2_sec = 0.0
+        blocks_p2: list[dict] = []
+
+        if need_pass2:
+            logger.info(
+                f"Pass-1 conf={avg_conf_p1:.2f}, blocks={len(blocks_p1)}, "
+                f"fields_found={important_fields_found} → running CLAHE fallback pass."
+            )
+            t0 = time.time()
+            try:
+                gray = cv2.cvtColor(img_opt, cv2.COLOR_BGR2GRAY)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                enhanced = clahe.apply(gray)
+                enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+                import torch
+                with torch.no_grad():
+                    results_p2 = reader.readtext(
+                        enhanced_bgr,
+                        canvas_size=_CANVAS_SIZE,
+                        detail=1,
+                        text_threshold=0.6,
+                        low_text=0.35,
+                        width_ths=0.7,
+                        workers=0,
+                    )
+                blocks_p2 = parse_easyocr_blocks(results_p2, mode="clahe")
+            except Exception as exc:
+                logger.debug(f"CLAHE pass error: {exc}")
+            inf2_sec = time.time() - t0
+
+        blocks = blocks_p1 + blocks_p2
+        metrics["ocr_inference_sec"] = round(inf1_sec + inf2_sec, 4)
+        metrics["method"] = "fullimage"
+        metrics["num_regions"] = 0
+
+    metrics["reprocess_sec"] = round(reprocess_sec, 4)
+    metrics["num_passes"] = 2 if reprocess_sec > 0 or metrics.get("method") == "fullimage_fallback" else 1
+
+    # ── 5. Deduplicate blocks (important when merging region results) ─────
+    seen_keys: set[str] = set()
+    deduped_blocks: list[dict] = []
+    for b in blocks:
+        dedup_key = f"{b['text'].lower().strip()}_{int(b['cy'] / 15)}_{int(b['cx'] / 15)}"
+        if dedup_key not in seen_keys:
+            seen_keys.add(dedup_key)
+            deduped_blocks.append(b)
+    blocks = deduped_blocks
+
+    # ── 6. Merge blocks and reconstruct text ──────────────────────────────
+    t0 = time.time()
+    lines = reconstruct_2d_lines(blocks)
     full_text = "\n".join(lines)
-    avg_conf = float(np.mean([b["prob"] for b in combined])) if combined else 0.70
+    avg_conf = float(np.mean([b["prob"] for b in blocks])) if blocks else 0.70
     metrics["ocr_postproc_sec"] = round(time.time() - t0, 4)
 
-    metrics["ocr_inference_sec"] = round(inf1_sec + inf2_sec, 4)
-    metrics["num_passes"] = 2 if need_pass2 else 1
+    # ── 7. Field extraction + quality score ───────────────────────────────
+    t0 = time.time()
+    final_fields = extract_structured_fields(full_text)
+    metrics["extraction_sec"] = round(time.time() - t0, 4)
+
+    quality = _compute_ocr_quality_score(
+        blocks, final_fields, reprocessed_regions, metrics.get("method", "unknown")
+    )
+    metrics["ocr_quality"] = quality
+    metrics["regions_reprocessed"] = reprocessed_regions
+
+    # ── 8. Total time ─────────────────────────────────────────────────────
+    metrics["total_sec"] = round(time.time() - t_total_start, 4)
 
     logger.info(
-        f"OCR done — passes={metrics['num_passes']}, "
-        f"blocks={len(combined)}, conf={avg_conf:.2f}, "
-        f"inference={metrics['ocr_inference_sec']}s"
+        f"OCR done — method={metrics['method']}, regions={metrics['num_regions']}, "
+        f"blocks={len(blocks)}, conf={avg_conf:.2f}, "
+        f"inference={metrics['ocr_inference_sec']}s, total={metrics['total_sec']}s, "
+        f"quality={quality['grade']}({quality['score']})"
     )
+
+    # Run GC once at the end of the pipeline
+    gc.collect()
+
     return full_text, avg_conf, metrics
 
 
@@ -393,7 +931,7 @@ def extract_structured_fields(raw_text: str, filename: str = "") -> dict:
     mrp_candidates: list[tuple[int, float]] = []  # (score, value)
 
     # Pre-scan: build per-line keyword flag sets
-    MRP_KWS  = {"MRP", "RETAIL PRICE", "MAXIMUM RETAIL PRICE"}
+    MRP_KWS  = {"MRP", "M.R.P.", "M.R.P", "RETAIL PRICE", "MAXIMUM RETAIL PRICE"}
     RS_KWS   = {"RS.", "RS .", "RS:", "₹", "INR"}
     TAX_KWS  = {"INCL", "INCL.", "ALL TAXES", "INCLUSIVE", "INCLUDING TAX"}
     SKIP_KWS = {
